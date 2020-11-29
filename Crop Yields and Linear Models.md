@@ -1,0 +1,135 @@
+---
+title: "Crop Yields and Linear Models"
+author: "Christopher Reed"
+date: "11/29/2020"
+output: html_document
+---
+
+
+
+Let's build a model for [crop yields around the world](https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-09-01/readme.md). We can build many models for country-crop combinations to estimate how crop yields are changing around the world.
+
+## Explore data
+
+Our first step will be to read in the data. The data is available at the link at the top of the document.
+
+
+```r
+key_crop_yields <- read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-09-01/key_crop_yields.csv')
+
+land_use <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-09-01/land_use_vs_yield_change_in_cereal_production.csv')
+```
+
+The following chunk cleans the column names, removes rows that are missing a country name (entity) and filters to the max year in each entity. Since there are so many countries, I focus on the top 30 by total population. I use `pull()` to grab the names of the top 30 countries and store them in the variable `top_countries`.
+
+
+```r
+# Clean names, filter out na rows (and World), group by entity, filter to max year in each group, ungroup, and find top 30 countries by total population
+top_countries <- land_use %>%
+  janitor::clean_names() %>%
+  filter(!is.na(code),
+         entity != "World") %>%
+  group_by(entity) %>%
+  filter(year == max(year)) %>%
+  ungroup %>%
+  slice_max(total_population_gapminder, n = 30) %>% 
+  pull(entity)
+
+# Print names of top 30 countries by total population
+top_countries
+```
+
+```
+##  [1] "China"                        "India"                       
+##  [3] "United States"                "Indonesia"                   
+##  [5] "Pakistan"                     "Brazil"                      
+##  [7] "Nigeria"                      "Bangladesh"                  
+##  [9] "Russia"                       "Mexico"                      
+## [11] "Japan"                        "Ethiopia"                    
+## [13] "Philippines"                  "Egypt"                       
+## [15] "Vietnam"                      "Democratic Republic of Congo"
+## [17] "Germany"                      "Turkey"                      
+## [19] "Iran"                         "Thailand"                    
+## [21] "United Kingdom"               "France"                      
+## [23] "Italy"                        "South Africa"                
+## [25] "Tanzania"                     "Myanmar"                     
+## [27] "Kenya"                        "South Korea"                 
+## [29] "Colombia"                     "Spain"
+```
+
+The raw yield data comes in a wide format (many columns), but we want it to be in a tidy, long format. We achieve this using the `pivot_longer()` function which collapses many columns into one. In this case, I take all the columns from `wheat_tonnes_per_hectare` to `bananas_tonnes_per_hectare` and collapse them into one column called crop. The values from these columns are in the yield column.
+
+I've also removed trimmed excess text from the crop names. I then decided to only look at wheat, rice, maize, and barley in `top_countries` which are defined in the above chunk.
+
+
+```r
+tidy_yields <- key_crop_yields %>%
+  janitor::clean_names() %>%
+  pivot_longer(wheat_tonnes_per_hectare:bananas_tonnes_per_hectare,
+               names_to = "crop", values_to = "yield") %>% 
+  mutate(crop = str_remove(crop, "_tonnes_per_hectare")) %>%
+  filter(crop %in% c("wheat", "rice", "maize", "barley"),
+         entity %in% top_countries,
+         !is.na(yield))
+```
+
+It's time to visualize our tidy yields. I'll make a scatter and line plot of yield against year. I use `facet_wrap` to make a plot for each of our 30 countries. 
+
+We learn that, in general, yields are increasing over time. Not all countries produce all 3 crops for the entire period. It looks like some countries are increasing more than others. 
+
+
+```r
+tidy_yields %>%
+  ggplot(aes(year, yield, color = crop)) +
+  geom_line(alpha = 0.7, size = 1.5) +
+  geom_point() +
+  facet_wrap(~ entity) +
+  scale_y_continuous(breaks = round(seq(0, max(tidy_yields$yield), by = 5),1)) +
+  labs(x = NULL, y = "yield (tons per hectare)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+          panel.spacing.x = unit(4, "mm"))
+```
+
+![plot of chunk unnamed-chunk-1](figure/unnamed-chunk-1-1.png)
+
+## Many models
+
+Now it's time to fit a basic linear model for each of the lines (country/crop) on the above plot. I use the `nest` function to make a small tibble of year/yield for each country and crop that is stored in the larger tibble. I then use `map` to iterate over those smaller tibbles and fit a linear model. The output will be the column `model` which contains statistics about each of the models.
+
+I'm interested in the year coefficient so I map the `tidy` function to each of the models to extract all the coefficients in the `coefs` column. I can then unnest the each of the tibbles in `coef` to filter to the year coefficient. Note that I adjust the p-value since we have a large multiple comparison issue with making so many models.
+
+
+```r
+tidy_lm <- tidy_yields %>%
+  nest(yields = c(year, yield)) %>%
+  mutate(model = map(yields, ~ lm(yield ~ year, data = .x) ))
+
+slopes <- tidy_lm %>%
+  mutate(coefs = map(model, tidy)) %>%
+  unnest(coefs) %>%
+  filter(term == "year") %>%
+  mutate(p.value = p.adjust(p.value))
+```
+ 
+## Explore results
+
+One way to visualize our results is to plot the model estimates against their p-value. I've made the y-axis on log scale because Some of the p-values are very large, some are very small, and many are close together. The vertical line separates positive year coef estimates (yields increasing with year) from negative year coef estimates (yields decreasing with year).
+
+Points lower down on the graph represent have smaller p-values. The p-value represents the proportion of observations that are as or more extreme than our observation if there really was no association between year and yield.
+
+
+
+```r
+slopes %>%
+  ggplot(aes(x = estimate, y = p.value, label = entity)) +
+  geom_vline(xintercept = 0, lty = 2, size = 1.5, alpha = 0.7, color = "gray50") +
+  geom_point(aes(color = crop), alpha = 0.8, size = 2.5,
+             show.legend = FALSE) +
+  geom_text_repel(size = 2.5) +
+  facet_wrap(~ crop) +
+  scale_y_log10() +
+  theme_light()
+```
+
+![plot of chunk unnamed-chunk-3](figure/unnamed-chunk-3-1.png)
+
